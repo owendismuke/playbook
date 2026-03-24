@@ -4,7 +4,11 @@ type: core
 owner_role: role.cto
 governing_parent: none
 related_playbooks: []
+related_lifecycle_namespaces:
+  - people-lifecycle.hiring
+  - people-lifecycle.onboarding
 lifecycle_stages:
+  - lifecycle.bootstrap
   - lifecycle.discovery
   - lifecycle.scoping
   - lifecycle.design
@@ -42,12 +46,17 @@ primary_output_artifacts:
   - artifact.privacy-impact
   - artifact.budget-request
   - artifact.decision-log
+  - artifact.event-log
+  - artifact.role-registry
+  - artifact.artifact-registry
+  - artifact.sla-registry
 trigger_events:
   - governance.playbook.create
   - governance.playbook.update
   - governance.audit.run
   - support.feedback.received
   - operations.incident.detected
+  - system.bootstrap.requested
 sla_class: sla.standard
 review_cadence: quarterly
 status: active
@@ -59,7 +68,7 @@ status: active
 
 ### rule.invariant.documented-existence
 - statement: If it is not documented, it does not exist.
-- requirement: Every lifecycle action, artifact, decision, transition, approval, rejection, exception, release, incident, and override MUST be recorded in a referenced artifact or decision record before it is treated as valid.
+- requirement: Every lifecycle action, artifact, decision, transition, approval, rejection, exception, release, incident, override, event, and registration MUST be recorded in a referenced artifact or decision record before it is treated as valid.
 - enforcement: Any work item, transition, or claim without a referenced record is INVALID and MUST be blocked by the enforcement engine.
 - validation_method: Verify presence of at least one canonical artifact reference or `artifact.decision-log` reference for every asserted work state.
 - override_policy: NOT OVERRIDABLE.
@@ -73,9 +82,9 @@ status: active
 
 ### rule.invariant.decision-traceability
 - statement: Every decision is traceable.
-- requirement: Every decision MUST be recorded as `artifact.decision-log` and MUST reference affected artifact IDs and lifecycle stage IDs.
-- enforcement: Any decision without a decision artifact, linked artifact reference, or linked lifecycle reference is INVALID.
-- validation_method: Verify each decision record includes `decision_id`, `linked_artifact_ids`, `linked_lifecycle_stage_ids`, `owner_role`, `timestamp`, and `outcome`.
+- requirement: Every decision MUST be recorded as `artifact.decision-log` and MUST reference affected artifact IDs, lifecycle stage IDs, version IDs, and event IDs where applicable.
+- enforcement: Any decision without a decision artifact, linked artifact reference, linked lifecycle reference, linked version reference, or linked event reference is INVALID.
+- validation_method: Verify each decision record includes `decision_id`, `linked_artifact_ids`, `linked_lifecycle_stage_ids`, `linked_versions`, `linked_event_ids`, `owner_role`, `timestamp`, and `outcome`.
 - override_policy: NOT OVERRIDABLE.
 
 ### rule.invariant.gated-lifecycle-transition
@@ -101,11 +110,33 @@ status: active
 
 ## 2. Lifecycle State Machine
 
+### lifecycle.bootstrap
+- rule_id: rule.lifecycle.bootstrap
+- purpose: Initialize the operating system, seed foundational registries, establish the event store, and create the first decision records required for all downstream validation.
+- runs_once: true
+- entry_criteria:
+  - governing_parent == none
+  - repository_initialization_event_recorded
+- exit_criteria:
+  - artifact.role-registry
+  - artifact.artifact-registry
+  - artifact.sla-registry
+  - artifact.event-log
+  - artifact.decision-log
+- owner_role: role.cto
+- owner_binding: Governing system owner for first-run initialization.
+- allowed_transitions:
+  - lifecycle.discovery
+
 ### lifecycle.discovery
 - rule_id: rule.lifecycle.discovery
 - purpose: Define the problem, intake source, business objective, customer impact, and initial success criteria.
 - entry_criteria:
-  - trigger_event_recorded
+  - artifact.role-registry
+  - artifact.artifact-registry
+  - artifact.sla-registry
+  - artifact.event-log
+  - artifact.decision-log
 - exit_criteria:
   - artifact.prd
 - owner_role: role.pm
@@ -115,11 +146,15 @@ status: active
 
 ### lifecycle.scoping
 - rule_id: rule.lifecycle.scoping
-- purpose: Bound the work, classify risk, classify threshold, and determine whether the change uses standard, small-change, or incident-driven execution.
+- purpose: Bound the work, classify risk, classify threshold, determine execution mode, and decide whether the change follows standard, small-change, or incident-driven execution.
 - entry_criteria:
-  - artifact.prd
+  - artifact.prd.status == active OR artifact.prd.status == under-review
 - exit_criteria:
-  - artifact.prd
+  - artifact.prd.status == active
+  - artifact.prd.scope_constraints != empty
+  - artifact.prd.threshold_classification != empty
+  - artifact.prd.customer_impact != empty
+  - artifact.prd.execution_mode != empty
 - owner_role: role.pm
 - owner_binding: Registered product or business owner for the scoped change.
 - allowed_transitions:
@@ -172,12 +207,12 @@ status: active
 - rule_id: rule.lifecycle.testing
 - purpose: Validate behavior, quality, and security readiness using the approved test plan and review artifacts.
 - entry_criteria:
-  - artifact.test-results
-  - artifact.runbook
+  - artifact.test-results.status == under-review
+  - artifact.runbook.status == under-review OR artifact.runbook.status == active
 - exit_criteria:
-  - artifact.test-results
-  - artifact.runbook
-  - artifact.security-review
+  - artifact.test-results.status == active
+  - artifact.security-review.status == active
+  - artifact.test-results.release_recommendation == accepted
 - owner_role: role.qa
 - owner_binding: Registered quality owner; implementing domains remain REQUIRED contributors.
 - allowed_transitions:
@@ -206,8 +241,8 @@ status: active
   - artifact.release-checklist
   - artifact.runbook
 - exit_criteria:
-  - artifact.release-checklist
-  - artifact.runbook
+  - transition_to_incident: trigger_event_recorded
+  - transition_to_deprecation: artifact.deprecation-plan
 - owner_role: role.devops
 - owner_binding: Registered service owner accountable for production operation.
 - allowed_transitions:
@@ -251,8 +286,9 @@ status: active
 - allowed_transitions: []
 
 ### rule.lifecycle.transition-equality
-- statement: Exit criteria of stage N MUST equal entry criteria of stage N+1 for the main lifecycle chain.
+- statement: Exit criteria of stage N MUST equal entry criteria of stage N+1 for the main forward lifecycle chain only.
 - main_chain:
+  - lifecycle.bootstrap -> lifecycle.discovery
   - lifecycle.discovery -> lifecycle.scoping
   - lifecycle.scoping -> lifecycle.design
   - lifecycle.design -> lifecycle.planning
@@ -261,14 +297,21 @@ status: active
   - lifecycle.testing -> lifecycle.release
   - lifecycle.release -> lifecycle.operations
 - boundary_sets:
+  - lifecycle.bootstrap.exit == lifecycle.discovery.entry == [artifact.role-registry, artifact.artifact-registry, artifact.sla-registry, artifact.event-log, artifact.decision-log]
   - lifecycle.discovery.exit == lifecycle.scoping.entry == [artifact.prd]
-  - lifecycle.scoping.exit == lifecycle.design.entry == [artifact.prd]
+  - lifecycle.scoping.exit == lifecycle.design.entry == [artifact.prd, artifact.prd.scope_constraints != empty, artifact.prd.threshold_classification != empty, artifact.prd.customer_impact != empty, artifact.prd.execution_mode != empty, artifact.prd.status == active]
   - lifecycle.design.exit == lifecycle.planning.entry == [artifact.tech-design-doc, artifact.architecture-diagram]
   - lifecycle.planning.exit == lifecycle.implementation.entry == [artifact.task, artifact.test-plan, artifact.sprint-plan]
   - lifecycle.implementation.exit == lifecycle.testing.entry == [artifact.test-results, artifact.runbook]
-  - lifecycle.testing.exit == lifecycle.release.entry == [artifact.test-results, artifact.runbook, artifact.security-review]
+  - lifecycle.testing.exit == lifecycle.release.entry == [artifact.test-results, artifact.test-results.status == active, artifact.security-review, artifact.security-review.status == active, artifact.test-results.release_recommendation == accepted]
   - lifecycle.release.exit == lifecycle.operations.entry == [artifact.release-checklist, artifact.runbook]
+- exclusion_note: lifecycle.operations exits are event-driven or deprecation-driven and are not part of the main forward boundary equality rule.
 - enforcement: Any main-chain transition with a non-matching boundary set is INVALID.
+
+### rule.lifecycle.boundary-evaluation-mode
+- statement: Lifecycle boundaries are satisfied only when both artifact presence and declared field or state conditions are met.
+- requirement: Artifact presence alone is insufficient when a lifecycle block defines additional field or state requirements.
+- enforcement: Any gate evaluator that validates only artifact existence for a mixed boundary is INVALID.
 
 ### rule.lifecycle.small-change-mode
 - statement: Small-change mode MAY collapse discovery, scoping, and design review depth for low-risk work but MUST NOT bypass non-overridable invariants.
@@ -277,12 +320,52 @@ status: active
   - customer_impact == low
   - security_privacy_impact == none
   - rollback_feasible == true
+  - effort_estimate < 3-developer-days
 - required_retained_artifacts:
   - artifact.prd
   - artifact.task
   - artifact.test-plan
   - artifact.runbook
-- enforcement: Any small-change execution missing retained artifacts is INVALID.
+- enforcement: Any small-change execution missing retained artifacts or violating entry conditions is INVALID.
+
+### rule.lifecycle.scoping-readiness
+- statement: Scoping is valid only when the governing PRD is field-complete and ready for design intake.
+- required_fields:
+  - scope_constraints
+  - threshold_classification
+  - customer_impact
+  - execution_mode
+- enforcement: A PRD entering design without all required scoping fields is INVALID.
+
+### rule.lifecycle.testing-readiness
+- statement: Testing is complete only when shared evidence has been validated and formal release disposition exists.
+- required_exit_state:
+  - artifact.test-results.status == active
+  - artifact.security-review.status == active
+  - artifact.test-results.release_recommendation == accepted
+- enforcement: Any release gate lacking all testing exit conditions is INVALID.
+
+### rule.lifecycle.operations-transition-policy
+- statement: Operations is a steady-state lifecycle with transition-specific exits.
+- transition_requirements:
+  - lifecycle.operations -> lifecycle.incident requires trigger_event_recorded
+  - lifecycle.operations -> lifecycle.deprecation requires artifact.deprecation-plan
+- enforcement: Any operations exit lacking the matching transition requirement is INVALID.
+
+### rule.lifecycle.people-ops-model
+- statement: Hiring and onboarding use a sibling governed lifecycle model that inherits this playbook's artifact, decision, status, event, versioning, and override rules.
+- people_ops_stages:
+  - people-lifecycle.hiring
+  - people-lifecycle.onboarding
+- mappings:
+  - artifact.hiring-scorecard -> people-lifecycle.hiring
+  - artifact.onboarding-checklist -> people-lifecycle.onboarding
+- enforcement: Delivery lifecycle stages MUST NOT be used to validate hiring or onboarding artifacts.
+
+### rule.lifecycle.people-ops-deferred-definition
+- statement: The core declares the people-lifecycle namespace and shared primitive rules, while full people-lifecycle stage definitions are completed in a people-ops extension playbook.
+- requirement: Until that extension exists, only lifecycle mapping and artifact ownership are governed here, not full people-stage transition rules.
+- enforcement: Treating the people lifecycle as fully defined within this core is INVALID.
 
 ## 3. Artifact Contracts
 
@@ -293,6 +376,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -301,6 +386,9 @@ status: active
   - problem_statement
   - target_outcomes
   - scope_constraints
+  - threshold_classification
+  - execution_mode
+  - effort_estimate
   - acceptance_criteria
   - customer_impact
 - lifecycle_stage_created: lifecycle.discovery
@@ -314,8 +402,9 @@ status: active
   - target_lifecycle_stage MUST include lifecycle.scoping.
   - target_lifecycle_stage MUST include lifecycle.design.
   - status MUST be governed by `rule.status.state-machine`.
+  - version MUST be governed by `rule.version.artifact`.
   - linked_decision_ids MUST contain at least one decision ID.
-  - problem_statement, target_outcomes, scope_constraints, acceptance_criteria, and customer_impact MUST be non-empty.
+  - problem_statement, target_outcomes, scope_constraints, threshold_classification, execution_mode, effort_estimate, acceptance_criteria, and customer_impact MUST be non-empty.
 
 ### artifact.tech-design-doc
 - rule_id: rule.artifact.tech-design-doc
@@ -324,6 +413,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -355,6 +446,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -386,6 +479,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -396,6 +491,7 @@ status: active
   - assignee_role
   - definition_of_done
   - dependency_references
+  - referenced_versions
 - lifecycle_stage_created: lifecycle.planning
 - lifecycle_stage_consumed:
   - lifecycle.implementation
@@ -406,6 +502,7 @@ status: active
   - target_lifecycle_stage MUST equal lifecycle.implementation.
   - assignee_role MUST be a registered role ID.
   - parent_design_references MUST reference artifact.tech-design-doc or artifact.architecture-diagram.
+  - referenced_versions MUST identify specific accepted upstream versions.
   - definition_of_done and dependency_references MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
@@ -416,6 +513,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -426,6 +525,7 @@ status: active
   - environment_requirements
   - pass_fail_criteria
   - observability_requirements
+  - referenced_versions
 - lifecycle_stage_created: lifecycle.planning
 - lifecycle_stage_consumed:
   - lifecycle.implementation
@@ -437,6 +537,7 @@ status: active
   - target_lifecycle_stage MUST include lifecycle.implementation.
   - target_lifecycle_stage MUST include lifecycle.testing.
   - test_scenarios, pass_fail_criteria, and observability_requirements MUST be non-empty.
+  - referenced_versions MUST identify specific accepted upstream versions.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.test-results
@@ -446,6 +547,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -457,6 +560,7 @@ status: active
   - evidence_links
   - release_recommendation
   - contributor_signoff_roles
+  - referenced_versions
 - lifecycle_stage_created: lifecycle.implementation
 - lifecycle_stage_consumed:
   - lifecycle.testing
@@ -469,6 +573,7 @@ status: active
   - target_lifecycle_stage MUST include lifecycle.release.
   - test_plan_reference MUST reference artifact.test-plan.
   - execution_summary, evidence_links, and contributor_signoff_roles MUST be non-empty.
+  - referenced_versions MUST identify specific accepted upstream versions.
   - release_recommendation MUST be one of [accepted, rejected, needs-revision].
   - linked_decision_ids MUST contain at least one decision ID.
 
@@ -479,6 +584,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -489,6 +596,9 @@ status: active
   - rollback_steps
   - approval_evidence
   - operational_readiness
+  - referenced_versions
+- conditional_required_fields:
+  - security_review_reference when change_class includes security-sensitive, vendor-integrating, or externally-exposing-data
 - lifecycle_stage_created: lifecycle.release
 - lifecycle_stage_consumed:
   - lifecycle.operations
@@ -499,6 +609,7 @@ status: active
   - source_lifecycle_stage MUST equal lifecycle.release.
   - target_lifecycle_stage MUST include lifecycle.operations.
   - rollback_steps, approval_evidence, and operational_readiness MUST be non-empty.
+  - referenced_versions MUST identify specific accepted upstream versions.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.runbook
@@ -508,6 +619,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -518,6 +631,7 @@ status: active
   - escalation_steps
   - rollback_reference
   - recovery_steps
+  - referenced_versions
 - lifecycle_stage_created: lifecycle.implementation
 - lifecycle_stage_consumed:
   - lifecycle.testing
@@ -533,6 +647,7 @@ status: active
   - target_lifecycle_stage MUST include lifecycle.operations.
   - target_lifecycle_stage MUST include lifecycle.incident.
   - observability_endpoints, rollback_reference, and recovery_steps MUST be non-empty.
+  - referenced_versions MUST identify specific accepted upstream versions.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.incident-report
@@ -542,6 +657,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -552,6 +669,7 @@ status: active
   - affected_services
   - mitigation_actions
   - timeline
+  - remediation_due_by
 - lifecycle_stage_created: lifecycle.incident
 - lifecycle_stage_consumed:
   - lifecycle.postmortem
@@ -561,7 +679,7 @@ status: active
   - source_lifecycle_stage MUST equal lifecycle.incident.
   - target_lifecycle_stage MUST equal lifecycle.postmortem.
   - severity MUST be one of [severity.p1, severity.p2, severity.p3].
-  - timeline and mitigation_actions MUST be non-empty.
+  - timeline, mitigation_actions, and remediation_due_by MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.postmortem
@@ -571,6 +689,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -601,6 +721,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -629,6 +751,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -654,6 +778,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -680,6 +806,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -689,21 +817,24 @@ status: active
   - dependency_graph
   - capacity_allocation
   - milestone_dates
+  - referenced_versions
 - lifecycle_stage_created: lifecycle.planning
 - lifecycle_stage_consumed:
   - lifecycle.implementation
 - validation_rules:
   - artifact_id MUST equal artifact.sprint-plan.
-  - execution_order, dependency_graph, capacity_allocation, and milestone_dates MUST be non-empty.
+  - execution_order, dependency_graph, capacity_allocation, milestone_dates, and referenced_versions MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.support-escalation
 - rule_id: rule.artifact.support-escalation
-- owner_role: role.pm
+- owner_role: role.support-intake
 - required_fields:
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -713,12 +844,15 @@ status: active
   - customer_impact
   - urgency_class
   - source_channel
+- optional_fields:
+  - supporting_roles
 - lifecycle_stage_created: lifecycle.operations
 - lifecycle_stage_consumed:
   - lifecycle.discovery
   - lifecycle.scoping
 - validation_rules:
   - artifact_id MUST equal artifact.support-escalation.
+  - owner_role MUST be a locked core or registered support or service intake role.
   - issue_summary, customer_impact, urgency_class, and source_channel MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
@@ -729,6 +863,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -754,6 +890,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -773,11 +911,13 @@ status: active
 
 ### artifact.hiring-scorecard
 - rule_id: rule.artifact.hiring-scorecard
-- owner_role: role.em
+- owner_role: role.people-ops
 - required_fields:
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -787,21 +927,24 @@ status: active
   - evaluation_dimensions
   - rubric
   - decision_criteria
-- lifecycle_stage_created: lifecycle.planning
+- lifecycle_stage_created: people-lifecycle.hiring
 - lifecycle_stage_consumed:
-  - lifecycle.operations
+  - people-lifecycle.hiring
 - validation_rules:
   - artifact_id MUST equal artifact.hiring-scorecard.
+  - owner_role MUST be a locked core or registered people-operations role.
   - role_scope, evaluation_dimensions, rubric, and decision_criteria MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.onboarding-checklist
 - rule_id: rule.artifact.onboarding-checklist
-- owner_role: role.em
+- owner_role: role.people-ops
 - required_fields:
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -811,21 +954,24 @@ status: active
   - required_access
   - training_steps
   - completion_criteria
-- lifecycle_stage_created: lifecycle.operations
+- lifecycle_stage_created: people-lifecycle.onboarding
 - lifecycle_stage_consumed:
-  - lifecycle.operations
+  - people-lifecycle.onboarding
 - validation_rules:
   - artifact_id MUST equal artifact.onboarding-checklist.
+  - owner_role MUST be a locked core or registered people-operations role.
   - role_scope, required_access, training_steps, and completion_criteria MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
 ### artifact.vendor-eval
 - rule_id: rule.artifact.vendor-eval
-- owner_role: role.security
+- owner_role: role.vendor-owner
 - required_fields:
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -835,12 +981,19 @@ status: active
   - risk_summary
   - compliance_findings
   - approval_recommendation
+  - security_owner_role
+  - requesting_owner_role
+- optional_fields:
+  - supporting_roles
 - lifecycle_stage_created: lifecycle.design
 - lifecycle_stage_consumed:
   - lifecycle.release
   - lifecycle.operations
 - validation_rules:
   - artifact_id MUST equal artifact.vendor-eval.
+  - owner_role MUST be a locked core or registered vendor requesting owner role.
+  - security_owner_role MUST be a registered security role.
+  - requesting_owner_role MUST be a registered role.
   - vendor_name, risk_summary, compliance_findings, and approval_recommendation MUST be non-empty.
   - linked_decision_ids MUST contain at least one decision ID.
 
@@ -851,6 +1004,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -860,6 +1015,8 @@ status: active
   - threat_findings
   - remediation_requirements
   - release_disposition
+- optional_fields:
+  - supporting_roles
 - lifecycle_stage_created: lifecycle.testing
 - lifecycle_stage_consumed:
   - lifecycle.release
@@ -876,6 +1033,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -900,6 +1059,8 @@ status: active
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
@@ -920,17 +1081,19 @@ status: active
 
 ### artifact.decision-log
 - rule_id: rule.artifact.decision-log
-- owner_role: role.em
+- owner_role: role.decision-steward
 - required_fields:
   - artifact_id
   - owner_role
   - status
+  - version
+  - previous_version_id
   - created_at
   - updated_at
   - source_lifecycle_stage
   - target_lifecycle_stage
-  - linked_decision_ids
   - decision_id
+  - driver_role
   - context
   - decision
   - rationale
@@ -938,11 +1101,17 @@ status: active
   - contributing_roles
   - linked_artifact_ids
   - linked_lifecycle_stage_ids
+  - linked_versions
+  - linked_event_ids
   - timestamp
   - threshold_classification
   - outcome
-- lifecycle_stage_created: lifecycle.discovery
+- optional_fields:
+  - predecessor_decision_ids
+  - supporting_roles
+- lifecycle_stage_created: lifecycle.bootstrap
 - lifecycle_stage_consumed:
+  - lifecycle.bootstrap
   - lifecycle.discovery
   - lifecycle.scoping
   - lifecycle.design
@@ -956,12 +1125,140 @@ status: active
   - lifecycle.deprecation
 - validation_rules:
   - artifact_id MUST equal artifact.decision-log.
+  - owner_role MUST be a locked core or registered decision record steward role.
+  - driver_role MUST be a registered role ID.
   - decision_id MUST be unique.
   - approver_role MUST be a registered role ID.
   - linked_artifact_ids MUST be non-empty.
   - linked_lifecycle_stage_ids MUST be non-empty.
+  - linked_versions MUST be non-empty.
+  - linked_event_ids MUST resolve against artifact.event-log.
+  - predecessor_decision_ids MAY be empty for first-instance decisions and MUST resolve when present.
   - threshold_classification MUST be one of [THRESHOLD_MINOR, THRESHOLD_MAJOR].
   - outcome MUST be one of [accepted, rejected, needs-revision].
+
+### artifact.event-log
+- rule_id: rule.artifact.event-log
+- owner_role: role.decision-steward
+- required_fields:
+  - artifact_id
+  - owner_role
+  - status
+  - version
+  - previous_version_id
+  - created_at
+  - updated_at
+  - source_lifecycle_stage
+  - target_lifecycle_stage
+  - linked_decision_ids
+  - event_records
+- lifecycle_stage_created: lifecycle.bootstrap
+- lifecycle_stage_consumed:
+  - lifecycle.bootstrap
+  - lifecycle.discovery
+  - lifecycle.scoping
+  - lifecycle.design
+  - lifecycle.planning
+  - lifecycle.implementation
+  - lifecycle.testing
+  - lifecycle.release
+  - lifecycle.operations
+  - lifecycle.incident
+  - lifecycle.postmortem
+  - lifecycle.deprecation
+- validation_rules:
+  - artifact_id MUST equal artifact.event-log.
+  - owner_role MUST be a locked core or registered decision record steward role.
+  - event_records MUST be append-only.
+  - each event record MUST satisfy rule.event.definition.
+  - linked_decision_ids MUST contain at least one decision ID for governed event batches.
+
+### artifact.role-registry
+- rule_id: rule.artifact.role-registry
+- owner_role: role.cto
+- required_fields:
+  - artifact_id
+  - owner_role
+  - status
+  - version
+  - previous_version_id
+  - created_at
+  - updated_at
+  - linked_decision_ids
+  - registered_ids
+  - registration_records
+- lifecycle_stage_created: lifecycle.bootstrap
+- lifecycle_stage_consumed:
+  - lifecycle.bootstrap
+  - lifecycle.discovery
+  - lifecycle.planning
+  - lifecycle.testing
+  - lifecycle.release
+  - lifecycle.operations
+- validation_rules:
+  - artifact_id MUST equal artifact.role-registry.
+  - registered_ids and registration_records MUST be non-empty.
+  - each registration record MUST satisfy rule.role.registration-record-format.
+  - each registration record MUST satisfy rule.registry.record-status.
+  - each registration record MUST satisfy rule.registry.record-versioning.
+
+### artifact.artifact-registry
+- rule_id: rule.artifact.artifact-registry
+- owner_role: role.cto
+- required_fields:
+  - artifact_id
+  - owner_role
+  - status
+  - version
+  - previous_version_id
+  - created_at
+  - updated_at
+  - linked_decision_ids
+  - registered_ids
+  - registration_records
+- lifecycle_stage_created: lifecycle.bootstrap
+- lifecycle_stage_consumed:
+  - lifecycle.bootstrap
+  - lifecycle.discovery
+  - lifecycle.planning
+  - lifecycle.testing
+  - lifecycle.release
+  - lifecycle.operations
+- validation_rules:
+  - artifact_id MUST equal artifact.artifact-registry.
+  - registered_ids and registration_records MUST be non-empty.
+  - each registration record MUST satisfy rule.artifact.registration-record-format.
+  - each registration record MUST satisfy rule.registry.record-status.
+  - each registration record MUST satisfy rule.registry.record-versioning.
+
+### artifact.sla-registry
+- rule_id: rule.artifact.sla-registry
+- owner_role: role.cto
+- required_fields:
+  - artifact_id
+  - owner_role
+  - status
+  - version
+  - previous_version_id
+  - created_at
+  - updated_at
+  - linked_decision_ids
+  - registered_ids
+  - registration_records
+- lifecycle_stage_created: lifecycle.bootstrap
+- lifecycle_stage_consumed:
+  - lifecycle.bootstrap
+  - lifecycle.discovery
+  - lifecycle.planning
+  - lifecycle.testing
+  - lifecycle.release
+  - lifecycle.operations
+- validation_rules:
+  - artifact_id MUST equal artifact.sla-registry.
+  - registered_ids and registration_records MUST be non-empty.
+  - each registration record MUST satisfy rule.sla.registration-record-format.
+  - each registration record MUST satisfy rule.registry.record-status.
+  - each registration record MUST satisfy rule.registry.record-versioning.
 
 ## 4. SLA System
 
@@ -983,8 +1280,38 @@ status: active
 - completion_time: 24-hours
 - escalation_trigger: immediate_on_assignment
 
+### sla-profile.document-review
+- rule_id: rule.sla-profile.document-review
+- parent_class: sla.standard
+- response_time: 4-business-hours
+- completion_time: 3-business-days
+- escalation_trigger: completion_deadline_at_risk
+- applicable_events:
+  - event.artifact.created
+  - event.artifact.updated
+
+### sla-profile.support-triage
+- rule_id: rule.sla-profile.support-triage
+- parent_class: sla.standard
+- response_time: 4-business-hours
+- completion_time: 1-business-day
+- escalation_trigger: response_time_exceeded
+- applicable_events:
+  - event.artifact.created
+  - event.lifecycle.entered
+
+### sla-profile.release-risk
+- rule_id: rule.sla-profile.release-risk
+- parent_class: sla.expedited
+- response_time: 2-hours
+- completion_time: 1-business-day
+- escalation_trigger: immediate_on_severity_classification
+- applicable_events:
+  - event.violation.detected
+  - event.sla.breached
+
 ### rule.sla.registration-policy
-- statement: Base SLA classes are locked; derived SLA profiles MAY exist only through governed registration.
+- statement: Base SLA classes are locked; derived SLA profiles MAY exist only through governed registration in `artifact.sla-registry`.
 - locked_base_classes:
   - sla.standard
   - sla.expedited
@@ -1013,12 +1340,12 @@ status: active
 ### rule.sla.trigger-mapping
 - statement: SLA application MUST be event-bound.
 - mappings:
-  - incident.severity.p1 -> sla.emergency
-  - incident.severity.p2 -> sla.expedited
-  - incident.severity.p3 -> sla.standard
-  - document-review.default -> sla-profile.document-review
-  - support-triage.default -> sla-profile.support-triage
-  - release-risk.default -> sla-profile.release-risk
+  - event.incident.severity-p1 -> sla.emergency
+  - event.incident.severity-p2 -> sla.expedited
+  - event.incident.severity-p3 -> sla.standard
+  - event.document-review.requested -> sla-profile.document-review
+  - event.support-triage.requested -> sla-profile.support-triage
+  - event.release-risk.detected -> sla-profile.release-risk
 - enforcement: Any event without a registered SLA binding is INVALID.
 
 ## 5. Decision Framework
@@ -1030,6 +1357,7 @@ status: active
   - approver: registered accountable approver
   - contributor: affected registered roles
   - informed: interested registered roles
+- clarification: The driver coordinates the decision process; the approver holds final authority.
 - canonical_approver_model: A decision MUST have exactly one approver role per decision record.
 - evidence_artifact: artifact.decision-log
 
@@ -1041,7 +1369,7 @@ status: active
 
 ### rule.decision.threshold-major
 - threshold_id: THRESHOLD_MAJOR
-- default_definition: Multi-domain change, externally visible contract change, material security/privacy exposure, irreversible data/process change, new vendor dependency, or material spend commitment.
+- default_definition: Multi-domain change, externally visible contract change, material security/privacy exposure, irreversible data/process change, new vendor dependency, material spend commitment, or organization-wide workflow change.
 - requirement: Changes classified at or above THRESHOLD_MAJOR MUST be approved by the registered accountable function head; governance changes MUST be approved by role.cto.
 - enforcement: A major decision without accountable approver evidence is INVALID.
 
@@ -1084,7 +1412,7 @@ status: active
   - artifact.prd
   - artifact.decision-log
 - validation_conditions:
-  - artifact.prd MUST include scope_constraints, customer_impact, and threshold classification references.
+  - artifact.prd MUST include scope_constraints, threshold_classification, customer_impact, and execution_mode.
   - gate record MUST include from_stage lifecycle.scoping and to_stage lifecycle.design.
   - budget-relevant work MUST reference artifact.budget-request.
 - acceptance_signal:
@@ -1185,7 +1513,7 @@ status: active
   - artifact.incident-report
   - artifact.decision-log
 - validation_conditions:
-  - artifact.incident-report MUST include severity, impact_window, mitigation_actions, and timeline.
+  - artifact.incident-report MUST include severity, impact_window, mitigation_actions, timeline, and remediation_due_by.
   - gate record MUST include from_stage lifecycle.incident and to_stage lifecycle.postmortem.
 - acceptance_signal:
   - acceptance_state MUST be one of [accepted, rejected, needs-revision].
@@ -1244,6 +1572,7 @@ status: active
   - artifact.architecture-diagram MAY use embedding_mode embedded-in-tech-design-doc
   - Discovery, Scoping, and Design MAY execute in small-change mode when `rule.lifecycle.small-change-mode` is satisfied
   - role substitution MUST be declared in artifact.decision-log when a specialized registered role is absent
+  - spike-mode MAY be approved by decision-log override for THRESHOLD_MINOR exploratory work that does not produce accepted implementation tasks
   - artifact.security-review remains REQUIRED for security-sensitive work
 - required_reviews:
   - owner_role review for all lifecycle exits
@@ -1336,63 +1665,63 @@ status: active
 
 ### anti-pattern.01-undocumented-work
 - description: Work is advanced without a referenced artifact or decision record.
-- detection_signal: lifecycle transition record exists with no artifact_reference and no artifact.decision-log reference.
-- consequence: transition is INVALID and MUST be rolled back to the prior valid stage.
+- detection_signal: Lifecycle transition record exists with no artifact_reference and no artifact.decision-log reference.
+- consequence: Transition is INVALID and MUST be rolled back to the prior valid stage.
 
 ### anti-pattern.02-ownerless-artifact
 - description: An artifact exists with no owner_role or more than one owner_role.
-- detection_signal: artifact metadata contains zero or multiple owner_role fields.
-- consequence: artifact is INVALID and MUST be rejected from all handoffs.
+- detection_signal: Artifact metadata contains zero or multiple owner_role fields.
+- consequence: Artifact is INVALID and MUST be rejected from all handoffs.
 
 ### anti-pattern.03-unlogged-decision
 - description: A decision changes scope, design, release, or operations state without a decision artifact.
-- detection_signal: state change exists with no linked_decision_ids or no artifact.decision-log entry.
-- consequence: decision is INVALID and dependent artifacts MUST be marked needs-revision.
+- detection_signal: State change exists with no linked_decision_ids or no artifact.decision-log entry.
+- consequence: Decision is INVALID and dependent artifacts MUST be marked needs-revision.
 
 ### anti-pattern.04-ungated-transition
 - description: A lifecycle stage changes without explicit acceptance_state.
 - detection_signal: from_stage and to_stage are recorded without acceptance_state.
-- consequence: transition is INVALID and MUST NOT be recognized by downstream stages.
+- consequence: Transition is INVALID and MUST NOT be recognized by downstream stages.
 
 ### anti-pattern.05-noncanonical-id
-- description: A lifecycle, artifact, role, SLA, severity, or profile value uses an unregistered string.
+- description: A lifecycle, artifact, role, SLA, severity, profile, event, or people-lifecycle value uses an unregistered string.
 - detection_signal: ID value is not present in the locked or registered canonical set.
-- consequence: record is INVALID and MUST be corrected before processing.
+- consequence: Record is INVALID and MUST be corrected before processing.
 
 ### anti-pattern.06-design-without-traceability
 - description: A design artifact does not reference its originating requirements artifact.
 - detection_signal: artifact.tech-design-doc or artifact.architecture-diagram has no reference to artifact.prd.
-- consequence: design handoff is INVALID and MUST be rejected.
+- consequence: Design handoff is INVALID and MUST be rejected.
 
 ### anti-pattern.07-testing-without-observability
 - description: Testing proceeds without observability requirements or endpoints.
 - detection_signal: artifact.test-plan.observability_requirements is empty or artifact.runbook.observability_endpoints is empty.
-- consequence: testing handoff is INVALID and release eligibility is denied.
+- consequence: Testing handoff is INVALID and release eligibility is denied.
 
 ### anti-pattern.08-release-without-rollback
 - description: Release approval is attempted without rollback documentation.
 - detection_signal: artifact.release-checklist.rollback_steps is empty or artifact.runbook.rollback_reference is empty.
-- consequence: release is INVALID and MUST be blocked.
+- consequence: Release is INVALID and MUST be blocked.
 
 ### anti-pattern.09-closed-incident-without-postmortem
 - description: An incident is marked resolved without a postmortem artifact.
 - detection_signal: artifact.incident-report status indicates closure and no artifact.postmortem reference exists.
-- consequence: incident closure is INVALID and operational compliance is failed.
+- consequence: Incident closure is INVALID and operational compliance is failed.
 
 ### anti-pattern.10-handoff-without-acceptance
 - description: A handoff package is delivered without explicit receiver acceptance state.
 - detection_signal: handoff record missing acceptance_state or accepting_role.
-- consequence: handoff is INVALID and ownership does not transfer.
+- consequence: Handoff is INVALID and ownership does not transfer.
 
 ### anti-pattern.11-override-without-replacement
 - description: A downstream playbook claims an override but does not define a replacement rule.
 - detection_signal: override record cites a rule ID but lacks replacement_rule.
-- consequence: override is INVALID and parent rule remains in force.
+- consequence: Override is INVALID and parent rule remains in force.
 
 ### anti-pattern.12-conflicting-boundary-set
 - description: Adjacent lifecycle stages define non-matching entry and exit artifact sets on the main chain.
-- detection_signal: lifecycle boundary comparison returns inequality.
-- consequence: lifecycle specification is INVALID and must be corrected before inheritance.
+- detection_signal: Lifecycle boundary comparison returns inequality.
+- consequence: Lifecycle specification is INVALID and must be corrected before inheritance.
 
 ## 11. Inheritance & Override Rules
 
@@ -1434,6 +1763,7 @@ status: active
   - owner_role
   - governing_parent
   - related_playbooks
+  - related_lifecycle_namespaces
   - lifecycle_stages
   - primary_input_artifacts
   - primary_output_artifacts
@@ -1464,12 +1794,16 @@ status: active
   - 16. Global Status State Machine
   - 17. System Dependency Graph
   - 18. Decision Record System
+  - 19. System Event Model
+  - 20. Concurrency Model
+  - 21. Versioning Model
 - enforcement: The core playbook MUST use the full required order; descendants that implement any of these sections MUST preserve the same relative order.
 
 ### rule.machine.canonical-ids-only
 - statement: All IDs MUST use locked core strings or registered extension strings only.
 - locked_core_ids:
   - lifecycle:
+      - lifecycle.bootstrap
       - lifecycle.discovery
       - lifecycle.scoping
       - lifecycle.design
@@ -1481,6 +1815,9 @@ status: active
       - lifecycle.incident
       - lifecycle.postmortem
       - lifecycle.deprecation
+  - people_lifecycle:
+      - people-lifecycle.hiring
+      - people-lifecycle.onboarding
   - artifact:
       - artifact.prd
       - artifact.tech-design-doc
@@ -1506,6 +1843,10 @@ status: active
       - artifact.privacy-impact
       - artifact.budget-request
       - artifact.decision-log
+      - artifact.event-log
+      - artifact.role-registry
+      - artifact.artifact-registry
+      - artifact.sla-registry
   - role:
       - role.cto
       - role.pm
@@ -1517,22 +1858,43 @@ status: active
       - role.security
       - role.design
       - role.data
+      - role.support-intake
+      - role.people-ops
+      - role.vendor-owner
+      - role.decision-steward
   - sla:
       - sla.standard
       - sla.expedited
       - sla.emergency
-  - severity:
-      - severity.p1
-      - severity.p2
-      - severity.p3
   - sla_profile:
       - sla-profile.document-review
       - sla-profile.support-triage
       - sla-profile.release-risk
+  - severity:
+      - severity.p1
+      - severity.p2
+      - severity.p3
+  - event:
+      - event.artifact.created
+      - event.artifact.updated
+      - event.artifact.accepted
+      - event.artifact.rejected
+      - event.lifecycle.entered
+      - event.lifecycle.exited
+      - event.violation.detected
+      - event.sla.breached
+      - event.decision.recorded
+      - event.incident.severity-p1
+      - event.incident.severity-p2
+      - event.incident.severity-p3
+      - event.document-review.requested
+      - event.support-triage.requested
+      - event.release-risk.detected
 - registered_extension_patterns:
   - role.<extension>
   - artifact.<extension>
   - sla-profile.<extension>
+  - event.<extension>
 - enforcement: Any non-canonical or unregistered ID is INVALID.
 
 ### rule.machine.traceable-relationships
@@ -1542,11 +1904,12 @@ status: active
   - target_lifecycle_stage
   - owner_role
   - linked_decision_ids
+  - version
 - enforcement: Any artifact contract or artifact instance without explicit relationships is INVALID.
 
 ### rule.machine.explicit-cross-references
 - statement: Cross-references MUST be explicit and MUST NOT be implied.
-- requirement: Every dependency, predecessor, successor, parent artifact, and decision reference MUST be declared by canonical ID.
+- requirement: Every dependency, predecessor, successor, parent artifact, decision reference, version reference, and event reference MUST be declared by canonical ID.
 - enforcement: Implicit references are INVALID.
 
 ### rule.machine.stable-rule-ids
@@ -1583,19 +1946,78 @@ status: active
 - enforcement: A breaking change without major version increment is INVALID.
 
 ### rule.role.registration-required
-- statement: New role IDs MAY be used only after governed registration.
-- requirement: Any new `role.<extension>` MUST be added through a governance update with owner semantics, escalation chain, and replacement rules where applicable.
+- statement: New role IDs MAY be used only after governed registration in artifact.role-registry.
+- requirement: Any new `role.<extension>` MUST be added through a governance update with owner semantics, escalation chain, absorbed-by fallback, and registration record.
 - enforcement: Unregistered role IDs are INVALID.
 
+### rule.role.registration-record-format
+- required_fields:
+  - registered_id
+  - display_name
+  - owner_archetype
+  - registration_decision_id
+  - effective_version
+  - status
+  - escalation_target
+  - absorbed_by_when_absent
+- storage_artifact: artifact.role-registry
+- enforcement: A role used without a matching active role-registry record is INVALID.
+
 ### rule.artifact.registration-required
-- statement: New artifact IDs MAY be used only after governed registration.
-- requirement: Any new `artifact.<extension>` MUST define owner_role, required_fields, lifecycle mapping, validation rules, and dependency edges.
+- statement: New artifact IDs MAY be used only after governed registration in artifact.artifact-registry.
+- requirement: Any new `artifact.<extension>` MUST define owner_role, required_fields, lifecycle mapping, dependency edges, and registration record.
 - enforcement: Unregistered artifact IDs are INVALID.
 
+### rule.artifact.registration-record-format
+- required_fields:
+  - registered_id
+  - display_name
+  - owner_archetype
+  - registration_decision_id
+  - effective_version
+  - status
+  - required_fields
+  - lifecycle_mapping
+  - dependency_edges
+- storage_artifact: artifact.artifact-registry
+- enforcement: An artifact used without a matching active artifact-registry record is INVALID.
+
 ### rule.governance.sla-registration
-- statement: New SLA profiles MAY be used only after governed registration.
-- requirement: Any new `sla-profile.<extension>` MUST declare parent base class, response target, completion target, escalation trigger, and event binding.
+- statement: New SLA profiles MAY be used only after governed registration in artifact.sla-registry.
+- requirement: Any new `sla-profile.<extension>` MUST declare parent base class, response target, completion target, escalation trigger, event binding, and registration record.
 - enforcement: Unregistered SLA profiles are INVALID.
+
+### rule.sla.registration-record-format
+- required_fields:
+  - registered_id
+  - display_name
+  - owner_archetype
+  - registration_decision_id
+  - effective_version
+  - status
+  - parent_class
+  - response_time
+  - completion_time
+  - event_binding
+- storage_artifact: artifact.sla-registry
+- enforcement: An SLA profile used without a matching active sla-registry record is INVALID.
+
+### rule.registry.record-status
+- valid_states:
+  - draft
+  - active
+  - deprecated
+- referenceability_rule: Only active registration records MAY be referenced by inherited playbooks.
+- enforcement: Referencing a draft or deprecated registration record is INVALID.
+
+### rule.registry.record-versioning
+- statement: Registration records inherit semantic versioning.
+- requirement: Breaking changes to registration records MUST use a major version increment.
+- enforcement: A registration update with mismatched version semantics is INVALID.
+
+### rule.registry.lookup-validity
+- statement: A referenced role, artifact, or SLA profile is valid only if the registry artifact is active, the registration record is active, and the requested effective version is compatible.
+- enforcement: Any lookup failing one of these conditions is INVALID.
 
 ### rule.governance.superseded-rule-deprecation
 - statement: A superseded rule MUST remain referenceable until all inheriting playbooks migrate.
@@ -1606,11 +2028,11 @@ status: active
 
 ### rule.validation.lifecycle-connected
 - requirement: All lifecycle stages MUST be connected through allowed transitions.
-- validation_method: Verify every locked lifecycle ID appears in Section 2 and participates in at least one incoming or outgoing transition except lifecycle.discovery incoming and lifecycle.deprecation outgoing.
+- validation_method: Verify every locked lifecycle ID appears in Section 2 and participates in at least one incoming or outgoing transition except lifecycle.bootstrap incoming and lifecycle.deprecation outgoing.
 
 ### rule.validation.artifacts-referenced
-- requirement: All locked and registered artifact IDs MUST be referenced by at least one lifecycle stage, one artifact contract, and one handoff, quality, governance, or dependency rule.
-- validation_method: Verify full artifact coverage across Sections 2, 3, 6, 9, 13, and 17.
+- requirement: All locked and registered artifact IDs MUST be referenced by at least one lifecycle stage, one artifact contract, and one handoff, quality, governance, dependency, event, or version rule.
+- validation_method: Verify full artifact coverage across Sections 2, 3, 6, 9, 13, 17, 19, and 21.
 
 ### rule.validation.handoffs-defined
 - requirement: All eight mandatory handoffs MUST be defined exactly once.
@@ -1618,16 +2040,16 @@ status: active
 
 ### rule.validation.no-conflicting-ids
 - requirement: No duplicate or conflicting canonical IDs MAY exist.
-- validation_method: Verify uniqueness across lifecycle IDs, artifact IDs, role IDs, SLA IDs, severity IDs, rule IDs, and anti-pattern IDs.
+- validation_method: Verify uniqueness across lifecycle IDs, people-lifecycle IDs, artifact IDs, role IDs, SLA IDs, severity IDs, event IDs, rule IDs, and anti-pattern IDs.
 
 ### rule.validation.yaml-schema-consistent
 - requirement: YAML frontmatter MUST contain all required schema keys exactly once and MUST use canonical or explicitly allowed root values.
-- validation_method: Verify keys [id, type, owner_role, governing_parent, related_playbooks, lifecycle_stages, primary_input_artifacts, primary_output_artifacts, trigger_events, sla_class, review_cadence, status] are present exactly once.
+- validation_method: Verify keys [id, type, owner_role, governing_parent, related_playbooks, related_lifecycle_namespaces, lifecycle_stages, primary_input_artifacts, primary_output_artifacts, trigger_events, sla_class, review_cadence, status] are present exactly once.
 
 ## 15. System Enforcement Engine
 
 ### rule.enforcement.global
-- detection: Any violation of a rule, invariant, validation, lifecycle gate, handoff contract, status transition, or dependency edge.
+- detection: Any violation of a rule, invariant, validation, lifecycle gate, handoff contract, status transition, dependency edge, event schema, concurrency rule, or version rule.
 - actions:
   - block lifecycle transition
   - mark affected artifacts as needs-revision
@@ -1645,6 +2067,8 @@ status: active
 ### rule.enforcement.break-glass-incident
 - statement: Incident intake MUST NOT be blocked by missing pre-incident documentation.
 - requirement: Missing runbook or missing prior operational artifacts during lifecycle.incident MUST generate remediation requirements instead of blocking incident entry.
+- remediation_sla: sla.expedited.completion_time
+- remediation_deadline: Remediation artifacts MUST be created within 2-business-days of incident closure.
 - enforcement: Incident intake is VALID on trigger_event_recorded; remediation artifacts become REQUIRED before incident closure.
 
 ## 16. Global Status State Machine
@@ -1676,10 +2100,23 @@ status: active
   - active -> deprecated: accountable owner_role with decision record
 - enforcement: Any invalid status transition is rejected.
 
+### rule.acceptance.rejection
+- statement: Rejected artifacts MUST re-enter review through a new versioned remediation cycle.
+- required_after_rejection:
+  - rejection_reason
+  - version increment
+  - updated acceptance state
+  - remediation evidence
+- enforcement: A rejected artifact that re-enters review without these fields is INVALID.
+
 ## 17. System Dependency Graph
 
 ### rule.graph.artifact-dependencies
 - edges:
+  - artifact.role-registry -> artifact.decision-log
+  - artifact.artifact-registry -> artifact.decision-log
+  - artifact.sla-registry -> artifact.decision-log
+  - artifact.event-log -> artifact.decision-log
   - artifact.okr -> artifact.prd
   - artifact.support-escalation -> artifact.prd
   - artifact.prd -> artifact.roadmap
@@ -1691,10 +2128,10 @@ status: active
   - artifact.task -> artifact.sprint-plan
   - artifact.test-plan -> artifact.test-results
   - artifact.sprint-plan -> artifact.test-results
+  - artifact.analytics-spec -> artifact.dashboard
   - artifact.test-results -> artifact.security-review
   - artifact.security-review -> artifact.release-checklist
   - artifact.runbook -> artifact.release-checklist
-  - artifact.analytics-spec -> artifact.dashboard
   - artifact.release-checklist -> artifact.dashboard
   - artifact.release-checklist -> artifact.incident-report
   - artifact.incident-report -> artifact.postmortem
@@ -1703,17 +2140,20 @@ status: active
 
 ### rule.graph.lifecycle-artifact-mapping
 - mappings:
-  - lifecycle.discovery -> [artifact.okr, artifact.support-escalation, artifact.prd, artifact.decision-log]
-  - lifecycle.scoping -> [artifact.prd, artifact.roadmap, artifact.budget-request, artifact.decision-log]
-  - lifecycle.design -> [artifact.tech-design-doc, artifact.architecture-diagram, artifact.analytics-spec, artifact.vendor-eval, artifact.privacy-impact, artifact.decision-log]
-  - lifecycle.planning -> [artifact.task, artifact.test-plan, artifact.sprint-plan, artifact.hiring-scorecard, artifact.decision-log]
-  - lifecycle.implementation -> [artifact.test-results, artifact.runbook, artifact.decision-log]
-  - lifecycle.testing -> [artifact.test-results, artifact.security-review, artifact.decision-log]
-  - lifecycle.release -> [artifact.release-checklist, artifact.dashboard, artifact.decision-log]
-  - lifecycle.operations -> [artifact.support-escalation, artifact.onboarding-checklist, artifact.dashboard, artifact.decision-log]
-  - lifecycle.incident -> [artifact.incident-report, artifact.decision-log]
-  - lifecycle.postmortem -> [artifact.postmortem, artifact.decision-log]
-  - lifecycle.deprecation -> [artifact.deprecation-plan, artifact.decision-log]
+  - lifecycle.bootstrap -> [artifact.role-registry, artifact.artifact-registry, artifact.sla-registry, artifact.event-log, artifact.decision-log]
+  - lifecycle.discovery -> [artifact.okr, artifact.support-escalation, artifact.prd, artifact.decision-log, artifact.event-log]
+  - lifecycle.scoping -> [artifact.prd, artifact.roadmap, artifact.budget-request, artifact.decision-log, artifact.event-log]
+  - lifecycle.design -> [artifact.tech-design-doc, artifact.architecture-diagram, artifact.analytics-spec, artifact.vendor-eval, artifact.privacy-impact, artifact.decision-log, artifact.event-log]
+  - lifecycle.planning -> [artifact.task, artifact.test-plan, artifact.sprint-plan, artifact.decision-log, artifact.event-log]
+  - lifecycle.implementation -> [artifact.test-results, artifact.runbook, artifact.decision-log, artifact.event-log]
+  - lifecycle.testing -> [artifact.test-results, artifact.security-review, artifact.decision-log, artifact.event-log]
+  - lifecycle.release -> [artifact.release-checklist, artifact.dashboard, artifact.decision-log, artifact.event-log]
+  - lifecycle.operations -> [artifact.support-escalation, artifact.dashboard, artifact.decision-log, artifact.event-log, artifact.role-registry, artifact.artifact-registry, artifact.sla-registry]
+  - lifecycle.incident -> [artifact.incident-report, artifact.decision-log, artifact.event-log]
+  - lifecycle.postmortem -> [artifact.postmortem, artifact.decision-log, artifact.event-log]
+  - lifecycle.deprecation -> [artifact.deprecation-plan, artifact.decision-log, artifact.event-log]
+  - people-lifecycle.hiring -> [artifact.hiring-scorecard, artifact.decision-log, artifact.event-log]
+  - people-lifecycle.onboarding -> [artifact.onboarding-checklist, artifact.decision-log, artifact.event-log]
 - enforcement: Any artifact used outside its declared lifecycle mapping without an override record is INVALID.
 
 ### rule.graph.handoff-artifact-mapping
@@ -1745,6 +2185,105 @@ status: active
 ### rule.decision.record-linkage
 - statement: Every artifact or lifecycle transition referencing a decision MUST link to `artifact.decision-log.decision_id`.
 - requirement:
-  - linked_decision_ids MUST resolve to existing artifact.decision-log records
-  - linked_artifact_ids and linked_lifecycle_stage_ids in the decision record MUST reciprocally reference the governed objects
+  - linked_decision_ids on non-decision artifacts MUST resolve to existing artifact.decision-log records
+  - predecessor_decision_ids on artifact.decision-log MUST resolve when present
+  - linked_artifact_ids, linked_lifecycle_stage_ids, linked_versions, and linked_event_ids in the decision record MUST reciprocally reference the governed objects
 - enforcement: Any non-resolving or one-way decision linkage is INVALID.
+
+## 19. System Event Model
+
+### rule.event.definition
+- event_types:
+  - event.artifact.created
+  - event.artifact.updated
+  - event.artifact.accepted
+  - event.artifact.rejected
+  - event.lifecycle.entered
+  - event.lifecycle.exited
+  - event.violation.detected
+  - event.sla.breached
+  - event.decision.recorded
+  - event.incident.severity-p1
+  - event.incident.severity-p2
+  - event.incident.severity-p3
+  - event.document-review.requested
+  - event.support-triage.requested
+  - event.release-risk.detected
+- required_event_record_fields:
+  - event_id
+  - event_type
+  - timestamp
+  - actor_role
+  - artifact_id
+  - artifact_version
+  - lifecycle_stage_id
+  - decision_id
+  - metadata
+- enforcement: Any event without the required schema is INVALID.
+
+### rule.event.triggers
+- required_triggers:
+  - artifact acceptance emits event.lifecycle.entered when the next stage boundary is satisfied
+  - artifact rejection emits event.violation.detected or remediation-needed metadata
+  - SLA breach emits event.sla.breached
+  - incident trigger emits event.lifecycle.entered for lifecycle.incident
+  - decision creation emits event.decision.recorded
+- enforcement: Any required trigger omitted by an event-bearing state change is INVALID.
+
+### rule.event.subscriptions
+- subscription_dimensions:
+  - ownership
+  - dependency_edge
+  - lifecycle_stage
+  - governance_scope
+- enforcement: Event consumers MUST subscribe based on declared ownership or dependency relationship; implicit subscriptions are INVALID.
+
+## 20. Concurrency Model
+
+### rule.concurrency.execution
+- statement: Parallel work is allowed only when explicit dependencies, versions, and invariants are satisfied.
+- permissions:
+  - multiple artifacts MAY be active within the same lifecycle stage
+  - multiple lifecycle stages MAY be active concurrently only when dependency edges are satisfied
+  - downstream artifacts MUST NOT advance to accepted if required upstream dependencies are unresolved or invalid
+- enforcement: Any concurrent advancement violating dependency or version rules is INVALID.
+
+### rule.concurrency.constraints
+- constraints:
+  - artifact.tech-design-doc and artifact.architecture-diagram MUST be accepted before dependent implementation tasks are accepted
+  - artifact.test-plan MAY begin during planning before all tasks exist
+  - artifact.analytics-spec, artifact.security-review, and artifact.privacy-impact MAY proceed in parallel where declared dependency edges permit
+  - release MUST NOT begin until all required concurrent artifacts resolve to accepted
+- enforcement: A concurrent artifact accepted before its required constraints are satisfied is INVALID.
+
+### rule.concurrency.conflict-resolution
+- statement: Conflicting concurrent updates require explicit reconciliation.
+- requirements:
+  - artifact version increment
+  - reconciliation decision in artifact.decision-log
+  - new acceptance state for impacted dependents when a breaking update occurs
+- enforcement: Conflicting updates without reconciliation are INVALID.
+
+## 21. Versioning Model
+
+### rule.version.artifact
+- statement: Every artifact MUST be versioned.
+- required_fields:
+  - version
+  - previous_version_id
+- version_format: semantic-versioning
+- enforcement: Any artifact missing required version fields is INVALID.
+
+### rule.version.increment
+- patch: non-meaning-changing correction or metadata update
+- minor: additive non-breaking change
+- major: breaking change requiring downstream revalidation
+- enforcement: Any version increment that does not match the impact of the artifact change is INVALID.
+
+### rule.version.enforcement
+- statement: Dependent artifacts MUST reference specific upstream versions.
+- requirements:
+  - dependent artifacts MUST reference specific upstream versions
+  - major version updates MUST invalidate dependent acceptance until revalidated
+  - rejected artifacts MUST produce a new version before re-entering review
+- enforcement: Any dependent artifact lacking specific version references or relying on invalidated major versions is INVALID.
